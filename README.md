@@ -31,6 +31,28 @@ func main() {
 }
 ```
 
+Weighted LRU cache example
+===========================
+
+```go
+package main
+
+import (
+	"fmt"
+	"github.com/hashicorp/golang-lru/v2"
+)
+
+func main() {
+	// bound the cache by total weight (e.g. bytes) instead of entry count;
+	// the weigher is fixed at construction so callers cannot misreport costs
+	l, _ := lru.NewWeighted[string, []byte](1<<20, func(k string, v []byte) int64 {
+		return int64(len(k) + len(v))
+	})
+	l.Add("key", make([]byte, 1024))
+	fmt.Printf("weight: %d of %d\n", l.Weight(), l.Cap())
+}
+```
+
 Expirable LRU cache example
 ===========================
 

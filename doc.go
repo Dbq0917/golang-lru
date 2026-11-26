@@ -6,6 +6,11 @@
 // Cache is a simple LRU cache. It is based on the LRU implementation in
 // groupcache: https://github.com/golang/groupcache/tree/master/lru
 //
+// WeightedCache is an LRU cache bounded by total entry weight instead of
+// entry count. Entry costs are computed by a Weigher fixed at construction
+// time, and the total weight is only maintained on mutation paths, so
+// lookups on hot keys never serialize on weight accounting.
+//
 // TwoQueueCache tracks frequently used and recently used entries separately.
 // This avoids a burst of accesses from taking out frequently used entries, at
 // the cost of about 2x computational overhead and some extra bookkeeping.
