@@ -4,7 +4,9 @@
 package lru
 
 import (
+	"math/rand"
 	"reflect"
+	"sync"
 	"testing"
 )
 
@@ -443,4 +445,39 @@ func TestCache_EvictionSameKey(t *testing.T) {
 			t.Errorf("evictedKeys got: %v want: %v", evictedKeys, want)
 		}
 	})
+}
+
+func TestCacheConcurrentSharded(t *testing.T) {
+	const size = 128
+
+	cache, err := New[int, int](size)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	for key := 0; key < size; key++ {
+		cache.Add(key, key)
+	}
+
+	var wg sync.WaitGroup
+	for goroutine := 0; goroutine < 16; goroutine++ {
+		wg.Add(1)
+		go func(seed int64) {
+			defer wg.Done()
+
+			rng := rand.New(rand.NewSource(seed))
+			for i := 0; i < 5000; i++ {
+				key := rng.Intn(1024)
+				if rng.Intn(10) < 4 {
+					cache.Add(key, key)
+				} else {
+					_, _ = cache.Get(key)
+				}
+			}
+		}(int64(goroutine + 1))
+	}
+	wg.Wait()
+
+	if length := cache.Len(); length != size {
+		t.Fatalf("Len() = %d, want %d", length, size)
+	}
 }

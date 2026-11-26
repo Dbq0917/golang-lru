@@ -24,6 +24,10 @@ type Entry[K comparable, V any] struct {
 	// The Value stored with this element.
 	Value V
 
+	// Recent is the global recency sequence number. Higher values mean
+	// the entry was accessed more recently.
+	Recent uint64
+
 	// The time this element would be cleaned up, optional
 	ExpiresAt time.Time
 
