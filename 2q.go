@@ -38,7 +38,21 @@ type TwoQueueCache[K comparable, V any] struct {
 	recent      simplelru.LRUCache[K, V]
 	frequent    simplelru.LRUCache[K, V]
 	recentEvict simplelru.LRUCache[K, struct{}]
-	lock        sync.RWMutex
+
+	// onEvictedCB is the externally registered eviction callback. It is
+	// invoked outside of the critical section so it is safe to re-enter
+	// the cache from within the callback.
+	onEvictedCB func(k K, v V)
+
+	// evictedKeys/evictedVals buffer evicted entries while the lock is held.
+	evictedKeys []K
+	evictedVals []V
+
+	// noEvict suppresses the internal sub-cache callbacks while an entry is
+	// moved between segments rather than evicted from the cache.
+	noEvict bool
+
+	lock sync.RWMutex
 }
 
 // New2Q creates a new TwoQueueCache using the default
@@ -47,9 +61,27 @@ func New2Q[K comparable, V any](size int) (*TwoQueueCache[K, V], error) {
 	return New2QParams[K, V](size, Default2QRecentRatio, Default2QGhostEntries)
 }
 
+// New2QWithEvict creates a new TwoQueueCache using the default values for the
+// parameters and the provided eviction callback. The callback is fired when an
+// entry is evicted from the recently used or frequently used segment, or when
+// a key falls out of the ghost (recently evicted) segment; ghost evictions
+// report the zero value since the original value was already reported when the
+// entry left the recently used segment. The callback is invoked outside of the
+// cache lock, so re-entering the cache from within it is safe.
+func New2QWithEvict[K comparable, V any](size int, onEvicted func(key K, value V)) (*TwoQueueCache[K, V], error) {
+	return New2QParamsWithEvict[K, V](size, Default2QRecentRatio, Default2QGhostEntries, onEvicted)
+}
+
 // New2QParams creates a new TwoQueueCache using the provided
 // parameter values.
 func New2QParams[K comparable, V any](size int, recentRatio, ghostRatio float64) (*TwoQueueCache[K, V], error) {
+	return New2QParamsWithEvict[K, V](size, recentRatio, ghostRatio, nil)
+}
+
+// New2QParamsWithEvict creates a new TwoQueueCache using the provided
+// parameter values and eviction callback. See New2QWithEvict for the callback
+// semantics.
+func New2QParamsWithEvict[K comparable, V any](size int, recentRatio, ghostRatio float64, onEvicted func(key K, value V)) (*TwoQueueCache[K, V], error) {
 	if size <= 0 {
 		return nil, errors.New("invalid size")
 	}
@@ -64,72 +96,147 @@ func New2QParams[K comparable, V any](size int, recentRatio, ghostRatio float64)
 	recentSize := int(float64(size) * recentRatio)
 	evictSize := int(float64(size) * ghostRatio)
 
-	// Allocate the LRUs
-	recent, err := simplelru.NewLRU[K, V](size, nil)
-	if err != nil {
-		return nil, err
-	}
-	frequent, err := simplelru.NewLRU[K, V](size, nil)
-	if err != nil {
-		return nil, err
-	}
-	recentEvict, err := simplelru.NewLRU[K, struct{}](evictSize, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	// Initialize the cache
 	c := &TwoQueueCache[K, V]{
 		size:        size,
 		recentSize:  recentSize,
 		recentRatio: recentRatio,
 		ghostRatio:  ghostRatio,
-		recent:      recent,
-		frequent:    frequent,
-		recentEvict: recentEvict,
+		onEvictedCB: onEvicted,
 	}
+	if onEvicted != nil {
+		c.initEvictBuffers()
+	}
+
+	// Only wire the internal callbacks when an external callback was
+	// registered so that a nil-callback cache keeps zero callback overhead.
+	var recentCB simplelru.EvictCallback[K, V]
+	var frequentCB simplelru.EvictCallback[K, V]
+	var ghostCB simplelru.EvictCallback[K, struct{}]
+	if onEvicted != nil {
+		recentCB = c.onEvicted
+		frequentCB = c.onEvicted
+		ghostCB = c.ghostEvicted
+	}
+
+	// Allocate the LRUs
+	recent, err := simplelru.NewLRU[K, V](size, recentCB)
+	if err != nil {
+		return nil, err
+	}
+	frequent, err := simplelru.NewLRU[K, V](size, frequentCB)
+	if err != nil {
+		return nil, err
+	}
+	recentEvict, err := simplelru.NewLRU[K, struct{}](evictSize, ghostCB)
+	if err != nil {
+		return nil, err
+	}
+
+	c.recent = recent
+	c.frequent = frequent
+	c.recentEvict = recentEvict
 	return c, nil
+}
+
+func (c *TwoQueueCache[K, V]) initEvictBuffers() {
+	c.evictedKeys = make([]K, 0, DefaultEvictedBufferSize)
+	c.evictedVals = make([]V, 0, DefaultEvictedBufferSize)
+}
+
+// onEvicted buffers entries evicted from the recently used or frequently used
+// segment. It runs while the cache lock is held.
+func (c *TwoQueueCache[K, V]) onEvicted(key K, value V) {
+	if c.noEvict {
+		return
+	}
+	c.evictedKeys = append(c.evictedKeys, key)
+	c.evictedVals = append(c.evictedVals, value)
+}
+
+// ghostEvicted buffers keys that fall out of the ghost (recently evicted)
+// segment. The original value was already reported when the entry left the
+// recently used segment, so the zero value is reported.
+func (c *TwoQueueCache[K, V]) ghostEvicted(key K, _ struct{}) {
+	if c.noEvict {
+		return
+	}
+	var zero V
+	c.evictedKeys = append(c.evictedKeys, key)
+	c.evictedVals = append(c.evictedVals, zero)
+}
+
+// drainEvicted takes ownership of the buffered evictions and resets the
+// buffers. It must be called while holding the cache lock. The returned
+// slices are only touched by the caller after the lock is released.
+func (c *TwoQueueCache[K, V]) drainEvicted() (keys []K, vals []V) {
+	if c.onEvictedCB == nil || len(c.evictedKeys) == 0 {
+		return nil, nil
+	}
+	keys, vals = c.evictedKeys, c.evictedVals
+	c.initEvictBuffers()
+	return keys, vals
+}
+
+// invokeEvicted fires the registered callback outside of the cache lock so
+// it is safe to re-enter the cache from within the callback. Evictions
+// produced by re-entrant calls remain in the shared buffers and are drained
+// by that call's own flush.
+func (c *TwoQueueCache[K, V]) invokeEvicted(keys []K, vals []V) {
+	for i := range keys {
+		c.onEvictedCB(keys[i], vals[i])
+	}
 }
 
 // Get looks up a key's value from the cache.
 func (c *TwoQueueCache[K, V]) Get(key K) (value V, ok bool) {
 	c.lock.Lock()
-	defer c.lock.Unlock()
-
 	// Check if this is a frequent value
 	if val, ok := c.frequent.Get(key); ok {
+		c.lock.Unlock()
 		return val, ok
 	}
 
 	// If the value is contained in recent, then we
 	// promote it to frequent
 	if val, ok := c.recent.Peek(key); ok {
+		// Promotion between segments is not an eviction.
+		c.noEvict = true
 		c.recent.Remove(key)
 		c.frequent.Add(key, val)
+		c.noEvict = false
+		c.lock.Unlock()
 		return val, ok
 	}
 
 	// No hit
+	c.lock.Unlock()
 	return
 }
 
 // Add adds a value to the cache.
 func (c *TwoQueueCache[K, V]) Add(key K, value V) {
 	c.lock.Lock()
-	defer c.lock.Unlock()
-
 	// Check if the value is frequently used already,
 	// and just update the value
 	if c.frequent.Contains(key) {
 		c.frequent.Add(key, value)
+		keys, vals := c.drainEvicted()
+		c.lock.Unlock()
+		c.invokeEvicted(keys, vals)
 		return
 	}
 
 	// Check if the value is recently used, and promote
 	// the value into the frequent list
 	if c.recent.Contains(key) {
+		// Promotion between segments is not an eviction.
+		c.noEvict = true
 		c.recent.Remove(key)
 		c.frequent.Add(key, value)
+		c.noEvict = false
+		keys, vals := c.drainEvicted()
+		c.lock.Unlock()
+		c.invokeEvicted(keys, vals)
 		return
 	}
 
@@ -137,14 +244,24 @@ func (c *TwoQueueCache[K, V]) Add(key K, value V) {
 	// frequently used list
 	if c.recentEvict.Contains(key) {
 		c.ensureSpace(true)
+		// The key is being recalled from the ghost segment; removing it
+		// there is not an eviction.
+		c.noEvict = true
 		c.recentEvict.Remove(key)
+		c.noEvict = false
 		c.frequent.Add(key, value)
+		keys, vals := c.drainEvicted()
+		c.lock.Unlock()
+		c.invokeEvicted(keys, vals)
 		return
 	}
 
 	// Add to the recently seen list
 	c.ensureSpace(false)
 	c.recent.Add(key, value)
+	keys, vals := c.drainEvicted()
+	c.lock.Unlock()
+	c.invokeEvicted(keys, vals)
 }
 
 // ensureSpace is used to ensure we have space in the cache
@@ -160,6 +277,8 @@ func (c *TwoQueueCache[K, V]) ensureSpace(recentEvict bool) {
 	// the target, evict from there
 	if recentLen > 0 && (recentLen > c.recentSize || (recentLen == c.recentSize && !recentEvict)) {
 		k, _, _ := c.recent.RemoveOldest()
+		// If the ghost segment is full, its oldest key is evicted and the
+		// internal ghost callback reports it with the zero value.
 		c.recentEvict.Add(k, struct{}{})
 		return
 	}
@@ -183,7 +302,6 @@ func (c *TwoQueueCache[K, V]) Cap() int {
 // Resize changes the cache size.
 func (c *TwoQueueCache[K, V]) Resize(size int) (evicted int) {
 	c.lock.Lock()
-	defer c.lock.Unlock()
 
 	// Recalculate the sub-sizes
 	recentSize := int(float64(size) * c.recentRatio)
@@ -201,10 +319,18 @@ func (c *TwoQueueCache[K, V]) Resize(size int) (evicted int) {
 	}
 
 	// Reallocate the LRUs
+	// Resizing the sub-caches only removes entries already accounted for
+	// above (value-bearing segments) or stale ghost keys, so suppress the
+	// internal callbacks to avoid duplicate notifications.
+	c.noEvict = true
 	c.recent.Resize(size)
 	c.frequent.Resize(size)
 	c.recentEvict.Resize(evictSize)
+	c.noEvict = false
 
+	keys, vals := c.drainEvicted()
+	c.lock.Unlock()
+	c.invokeEvicted(keys, vals)
 	return diff
 }
 
@@ -231,25 +357,44 @@ func (c *TwoQueueCache[K, V]) Values() []V {
 // Remove removes the provided key from the cache.
 func (c *TwoQueueCache[K, V]) Remove(key K) {
 	c.lock.Lock()
-	defer c.lock.Unlock()
 	if c.frequent.Remove(key) {
+		keys, vals := c.drainEvicted()
+		c.lock.Unlock()
+		c.invokeEvicted(keys, vals)
 		return
 	}
 	if c.recent.Remove(key) {
+		keys, vals := c.drainEvicted()
+		c.lock.Unlock()
+		c.invokeEvicted(keys, vals)
 		return
 	}
-	if c.recentEvict.Remove(key) {
+	if c.recentEvict.Contains(key) {
+		// An explicit removal of a ghost key is user-initiated, not an
+		// eviction, so it must not trigger the callback.
+		c.noEvict = true
+		c.recentEvict.Remove(key)
+		c.noEvict = false
+		c.lock.Unlock()
 		return
 	}
+	c.lock.Unlock()
 }
 
 // Purge is used to completely clear the cache.
 func (c *TwoQueueCache[K, V]) Purge() {
 	c.lock.Lock()
-	defer c.lock.Unlock()
+	// Entries leaving the value-bearing segments are reported; the ghost
+	// entries were already reported when they left the recent segment, so
+	// suppress their callback.
+	c.noEvict = true
+	c.recentEvict.Purge()
+	c.noEvict = false
 	c.recent.Purge()
 	c.frequent.Purge()
-	c.recentEvict.Purge()
+	keys, vals := c.drainEvicted()
+	c.lock.Unlock()
+	c.invokeEvicted(keys, vals)
 }
 
 // Contains is used to check if the cache contains a key
