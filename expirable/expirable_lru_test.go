@@ -718,3 +718,168 @@ func TestOnEvictStillSynced(t *testing.T) {
 		t.Fatal("onEvict must run before Remove returns")
 	}
 }
+
+// TestAddWithTTL_PerEntryExpiration verifies entries with different TTLs
+// share one cache without taking each other down when the short-lived entry
+// is reaped.
+func TestAddWithTTL_PerEntryExpiration(t *testing.T) {
+	cache := NewLRU[string, string](0, nil, time.Hour)
+
+	cache.AddWithTTL("short", "1", 60*time.Millisecond)
+	cache.AddWithTTL("long", "2", time.Hour)
+	cache.Add("default", "3") // uses the cache-wide default TTL
+
+	time.Sleep(200 * time.Millisecond)
+
+	if cache.Len() != 2 {
+		t.Fatalf("expected only the short entry to be reaped, got len %d", cache.Len())
+	}
+	if _, ok := cache.Get("short"); ok {
+		t.Fatal("short-lived entry should have expired")
+	}
+	if _, ok := cache.Get("long"); !ok {
+		t.Fatal("long-lived entry must survive the short entry's expiration")
+	}
+	if _, ok := cache.Get("default"); !ok {
+		t.Fatal("default-TTL entry must survive the short entry's expiration")
+	}
+}
+
+// TestAddWithTTL_ZeroFallsBackToDefault verifies a non-positive per-entry
+// TTL falls back to the cache-wide default.
+func TestAddWithTTL_ZeroFallsBackToDefault(t *testing.T) {
+	cache := NewLRU[string, string](0, nil, 80*time.Millisecond)
+
+	cache.AddWithTTL("fallback", "1", 0)
+	cache.AddWithTTL("override", "2", time.Hour)
+
+	time.Sleep(200 * time.Millisecond)
+
+	if _, ok := cache.Get("fallback"); ok {
+		t.Fatal("entry with zero TTL should follow the short default TTL")
+	}
+	if _, ok := cache.Get("override"); !ok {
+		t.Fatal("explicit long TTL must not be overridden by the default")
+	}
+}
+
+// TestAddWithTTL_LazyReaper verifies a finite per-entry TTL starts the
+// cleanup goroutine even when expiration was disabled at construction.
+func TestAddWithTTL_LazyReaper(t *testing.T) {
+	cache := NewLRU[string, string](0, nil, 0)
+
+	if cache.reaper {
+		t.Fatal("a cache with no default TTL must not start a reaper eagerly")
+	}
+
+	cache.AddWithTTL("k", "v", 50*time.Millisecond)
+	if !cache.Contains("k") {
+		t.Fatal("entry should be present before its TTL elapses")
+	}
+	if !cache.reaper {
+		t.Fatal("adding a finite-TTL entry must start the reaper lazily")
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	if cache.Len() != 0 {
+		t.Fatalf("expected the lazily-reaped entry to be gone, got len %d", cache.Len())
+	}
+	if _, ok := cache.Get("k"); ok {
+		t.Fatal("entry should have expired without a default TTL")
+	}
+}
+
+// TestDefaultTTL_NoReaper verifies a cache whose expiration is disabled
+// keeps no background goroutine when only default-TTL entries are added.
+func TestDefaultTTL_NoReaper(t *testing.T) {
+	cache := NewLRU[string, string](0, nil, 0)
+	cache.Add("a", "1")
+	cache.AddWithTTL("b", "2", 0) // falls back to the no-expiry default
+
+	if cache.reaper {
+		t.Fatal("no reaper should run while every entry uses the no-expiry TTL")
+	}
+	cache.Close()
+}
+
+// TestContainsIgnoresExpiration pins the documented behavior: only Get and
+// Peek consider expiration, while Contains reports pure membership.
+func TestContainsIgnoresExpiration(t *testing.T) {
+	cache := NewLRU[string, string](0, nil, time.Hour)
+	cache.Add("k", "v")
+
+	// Force expiration in-place without waiting for the reaper.
+	cache.mu.Lock()
+	cache.items["k"].ExpiresAt = time.Now().Add(-time.Hour)
+	cache.mu.Unlock()
+
+	if !cache.Contains("k") {
+		t.Fatal("Contains must not consider expiration")
+	}
+	if _, ok := cache.Get("k"); ok {
+		t.Fatal("Get must hide an expired entry")
+	}
+	if _, ok := cache.Peek("k"); ok {
+		t.Fatal("Peek must hide an expired entry")
+	}
+}
+
+// TestAddWithTTL_RefreshExpiration verifies re-adding a key renews its
+// expiration using the new per-entry TTL.
+func TestAddWithTTL_RefreshExpiration(t *testing.T) {
+	cache := NewLRU[string, string](0, nil, time.Hour)
+
+	cache.AddWithTTL("k", "old", 40*time.Millisecond)
+	cache.AddWithTTL("k", "new", time.Hour)
+
+	time.Sleep(150 * time.Millisecond)
+
+	if cache.Len() != 1 {
+		t.Fatalf("refreshed entry should still be present, got len %d", cache.Len())
+	}
+	if v, ok := cache.Get("k"); !ok || v != "new" {
+		t.Fatalf("expected refreshed value, got %q ok=%v", v, ok)
+	}
+}
+
+// TestExpiryHeapInvariant verifies the expiry heap stays consistent with the
+// item map across adds, re-adds, evictions and removals.
+func TestExpiryHeapInvariant(t *testing.T) {
+	cache := NewLRU[int, int](4, nil, time.Hour)
+
+	check := func(stage string) {
+		t.Helper()
+		if cache.expiry.Len() != len(cache.items) {
+			t.Fatalf("%s: heap size %d != items size %d", stage, cache.expiry.Len(), len(cache.items))
+		}
+		for i, ent := range cache.expiry {
+			if ent.HeapIndex != i {
+				t.Fatalf("%s: entry at %d reports HeapIndex %d", stage, i, ent.HeapIndex)
+			}
+			if parent := (i - 1) / 2; i > 0 && cache.expiry[parent].ExpiresAt.After(ent.ExpiresAt) {
+				t.Fatalf("%s: heap order violated at index %d", stage, i)
+			}
+			if got := cache.items[ent.Key]; got != ent {
+				t.Fatalf("%s: heap entry for key %d not backed by items map", stage, ent.Key)
+			}
+		}
+	}
+
+	for i := 0; i < 4; i++ {
+		cache.AddWithTTL(i, i, time.Duration(100-i*10)*time.Millisecond)
+		check("add")
+	}
+	// Exceed capacity to exercise LRU eviction through the heap.
+	cache.AddWithTTL(99, 99, 10*time.Millisecond)
+	check("eviction")
+
+	cache.AddWithTTL(1, 1, time.Second)
+	check("readd")
+
+	cache.Remove(2)
+	check("remove")
+
+	cache.Purge()
+	check("purge")
+}

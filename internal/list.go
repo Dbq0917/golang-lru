@@ -27,8 +27,9 @@ type Entry[K comparable, V any] struct {
 	// The time this element would be cleaned up, optional
 	ExpiresAt time.Time
 
-	// The expiry bucket item was put in, optional
-	ExpireBucket uint8
+	// HeapIndex is the element's position in the expiry min-heap, or -1
+	// when it is not tracked for expiration, optional
+	HeapIndex int
 }
 
 // PrevEntry returns the previous list element or nil.
@@ -89,7 +90,7 @@ func (l *LruList[K, V]) insert(e, at *Entry[K, V]) *Entry[K, V] {
 
 // insertValue is a convenience wrapper for insert(&Entry{Value: v, ExpiresAt: ExpiresAt}, at).
 func (l *LruList[K, V]) insertValue(k K, v V, expiresAt time.Time, at *Entry[K, V]) *Entry[K, V] {
-	return l.insert(&Entry[K, V]{Value: v, Key: k, ExpiresAt: expiresAt}, at)
+	return l.insert(&Entry[K, V]{Value: v, Key: k, ExpiresAt: expiresAt, HeapIndex: -1}, at)
 }
 
 // Remove removes e from its list, decrements l.len

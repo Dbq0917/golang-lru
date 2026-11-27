@@ -77,3 +77,21 @@ func main() {
 	// Cache len: 1
 }
 ```
+
+Per-entry TTL
+=============
+
+`AddWithTTL` gives a single entry its own lifetime instead of the
+cache-wide default passed to `NewLRU`. A non-positive TTL falls back to
+that default. This lets entries with different lifetimes share one cache
+(and one capacity limit); each entry is reaped individually when its own
+expiration arrives, without taking longer-lived entries with it.
+
+```go
+cache := expirable.NewLRU[string, string](128, nil, time.Hour)
+
+cache.AddWithTTL("session", "...", 2*time.Hour)
+cache.AddWithTTL("captcha", "...", 5*time.Minute)
+cache.AddWithTTL("config", "...", 24*time.Hour)
+cache.Add("default", "...") // uses the cache-wide default TTL
+```

@@ -4,6 +4,7 @@
 package expirable
 
 import (
+	"container/heap"
 	"sync"
 	"time"
 
@@ -30,30 +31,21 @@ type LRU[K comparable, V any] struct {
 	onEvict   EvictCallback[K, V]
 
 	// expirable options
-	mu   sync.Mutex
-	ttl  time.Duration
-	done chan struct{}
-
-	// buckets for expiration
-	buckets []bucket[K, V]
-	// uint8 because it's number between 0 and numBuckets
-	nextCleanupBucket uint8
+	mu     sync.Mutex
+	ttl    time.Duration
+	done   chan struct{}
+	wake   chan struct{}
+	reaper bool
 
 	cleanupStopped bool
-}
 
-// bucket is a container for holding entries to be expired
-type bucket[K comparable, V any] struct {
-	entries     map[K]*internal.Entry[K, V]
-	newestEntry time.Time
+	// expiry is a min-heap ordered by ExpiresAt used to expire entries
+	// with individual TTLs without scanning the whole cache.
+	expiry expiryHeap[K, V]
 }
 
 // noEvictionTTL - very long ttl to prevent eviction
 const noEvictionTTL = time.Hour * 24 * 365 * 10
-
-// because of uint8 usage for nextCleanupBucket, should not exceed 256.
-// casting it as uint8 explicitly requires type conversions in multiple places
-const numBuckets = 100
 
 // NewLRU returns a new thread-safe cache with expirable entries.
 //
@@ -61,10 +53,14 @@ const numBuckets = 100
 //
 // Providing 0 TTL turns expiring off.
 //
+// Per-entry TTLs can be configured through AddWithTTL; see its documentation.
+//
 // onEvict, if non-nil, is invoked for each evicted entry outside the cache's
 // internal lock; see EvictCallback for the guarantees callbacks get.
 //
-// Delete expired entries every 1/100th of ttl value. Goroutine which deletes expired entries runs indefinitely.
+// A background goroutine reaps expired entries. It starts immediately when
+// ttl is positive, and on the first finite-TTL Add otherwise. It runs until
+// Close is called.
 func NewLRU[K comparable, V any](size int, onEvict EvictCallback[K, V], ttl time.Duration) *LRU[K, V] {
 	if size < 0 {
 		size = 0
@@ -80,16 +76,13 @@ func NewLRU[K comparable, V any](size int, onEvict EvictCallback[K, V], ttl time
 		items:          make(map[K]*internal.Entry[K, V]),
 		onEvict:        onEvict,
 		done:           make(chan struct{}),
+		wake:           make(chan struct{}, 1),
 		cleanupStopped: false,
 	}
 
-	// initialize the buckets
-	res.buckets = make([]bucket[K, V], numBuckets)
-	for i := 0; i < numBuckets; i++ {
-		res.buckets[i] = bucket[K, V]{entries: make(map[K]*internal.Entry[K, V])}
+	if ttl != noEvictionTTL {
+		res.startReaper()
 	}
-
-	res.startGoroutine()
 	return &res
 }
 
@@ -123,22 +116,43 @@ func (c *LRU[K, V]) Purge() {
 			evicted = append(evicted, evictedEntry[K, V]{key: k, value: v.Value})
 		}
 	}
-	for _, b := range c.buckets {
-		for _, ent := range b.entries {
-			delete(b.entries, ent.Key)
-		}
-	}
+	c.expiry = make(expiryHeap[K, V], 0)
 	c.evictList.Init()
 	c.mu.Unlock()
 	c.fireCallbacks(evicted)
 }
 
-// Add adds a value to the cache. Returns true if an eviction occurred.
-// Returns false if there was no eviction: the item was already in the cache,
-// or the size was not exceeded.
+// Add adds a value to the cache using the cache's default TTL. Returns true
+// if an eviction occurred. Returns false if there was no eviction: the item
+// was already in the cache, or the size was not exceeded.
 // If an eviction occurred, onEvict is invoked for the evicted entry outside
 // the cache's internal lock.
 func (c *LRU[K, V]) Add(key K, value V) (evicted bool) {
+	return c.add(key, value, c.ttl)
+}
+
+// AddWithTTL adds a value to the cache with a per-entry TTL.
+//
+// The entry expires at now + ttl independently of the cache-wide TTL passed
+// to NewLRU, so entries with different lifetimes (e.g. sessions, captchas,
+// config) can share one cache without competing for separate capacity.
+//
+// A non-positive ttl makes the entry fall back to the cache's default TTL.
+// Re-adding an existing key refreshes both its value and its expiration,
+// using the provided ttl.
+//
+// Returns true if an LRU eviction occurred; onEvict is then invoked for the
+// evicted entry outside the cache's internal lock.
+func (c *LRU[K, V]) AddWithTTL(key K, value V, ttl time.Duration) (evicted bool) {
+	if ttl <= 0 {
+		ttl = c.ttl
+	}
+	return c.add(key, value, ttl)
+}
+
+// add inserts or refreshes an entry with the given TTL. Has to be called
+// without the lock, which is managed here.
+func (c *LRU[K, V]) add(key K, value V, ttl time.Duration) (evicted bool) {
 	var evictedEntries []evictedEntry[K, V]
 	c.mu.Lock()
 	defer func() {
@@ -150,24 +164,41 @@ func (c *LRU[K, V]) Add(key K, value V) (evicted bool) {
 	// Check for existing item
 	if ent, ok := c.items[key]; ok {
 		c.evictList.MoveToFront(ent)
-		c.removeFromBucket(ent) // remove the entry from its current bucket as expiresAt is renewed
 		ent.Value = value
-		ent.ExpiresAt = now.Add(c.ttl)
-		c.addToBucket(ent)
+		ent.ExpiresAt = now.Add(ttl)
+		heap.Fix(&c.expiry, ent.HeapIndex)
+		c.wakeCleanupIfEarliest(ent)
 		return false
 	}
 
 	// Add new item
-	ent := c.evictList.PushFrontExpirable(key, value, now.Add(c.ttl))
+	ent := c.evictList.PushFrontExpirable(key, value, now.Add(ttl))
 	c.items[key] = ent
-	c.addToBucket(ent) // adds the entry to the appropriate bucket and sets entry.expireBucket
+	heap.Push(&c.expiry, ent)
+	if ttl != noEvictionTTL {
+		c.startReaper()
+	}
+	c.wakeCleanupIfEarliest(ent)
 
-	evict := c.size > 0 && c.evictList.Length() > c.size
+	evicted = c.size > 0 && c.evictList.Length() > c.size
 	// Verify size not exceeded
-	if evict {
+	if evicted {
 		c.removeOldest(&evictedEntries)
 	}
-	return evict
+	return evicted
+}
+
+// wakeCleanupIfEarliest nudges the reaper when ent is now the soonest to
+// expire, so a short-TTL entry added among long-TTL ones is reaped on time.
+// Has to be called with lock!
+func (c *LRU[K, V]) wakeCleanupIfEarliest(ent *internal.Entry[K, V]) {
+	if c.expiry.Len() == 0 || c.expiry[0] != ent {
+		return
+	}
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
 }
 
 // Get looks up a key's value from the cache.
@@ -343,62 +374,39 @@ func (c *LRU[K, V]) removeOldest(evicted *[]evictedEntry[K, V]) {
 func (c *LRU[K, V]) removeElement(e *internal.Entry[K, V], evicted *[]evictedEntry[K, V]) {
 	c.evictList.Remove(e)
 	delete(c.items, e.Key)
-	c.removeFromBucket(e)
+	if e.HeapIndex >= 0 {
+		heap.Remove(&c.expiry, e.HeapIndex)
+	}
 	if c.onEvict != nil {
 		*evicted = append(*evicted, evictedEntry[K, V]{key: e.Key, value: e.Value})
 	}
 }
 
-// deleteExpired deletes expired records from the oldest bucket, waiting for the newest entry
-// in it to expire first.
+// removeFromExpiry drops an entry that has already been popped from the
+// expiry heap by deleteExpired, without touching the heap again. Has to be
+// called with lock!
+func (c *LRU[K, V]) removeFromExpiry(e *internal.Entry[K, V], evicted *[]evictedEntry[K, V]) {
+	c.evictList.Remove(e)
+	delete(c.items, e.Key)
+	if c.onEvict != nil {
+		*evicted = append(*evicted, evictedEntry[K, V]{key: e.Key, value: e.Value})
+	}
+}
+
+// deleteExpired removes every entry whose ExpiresAt is in the past.
+// The expiry min-heap orders entries by expiration, so only expired entries
+// are touched: the scan stops at the first still-valid entry instead of
+// walking the whole cache.
 func (c *LRU[K, V]) deleteExpired() {
 	var evicted []evictedEntry[K, V]
 	c.mu.Lock()
-
-	// grab done channel to detect Closes
-	done := c.done
-
-	bucketIdx := c.nextCleanupBucket
-	timeToExpire := time.Until(c.buckets[bucketIdx].newestEntry)
-	// wait for newest entry to expire before cleanup without holding lock
-	if timeToExpire > 0 {
-		c.mu.Unlock()
-		select {
-		case <-time.After(timeToExpire):
-		case <-done:
-			return
-		}
-		c.mu.Lock()
-
-		select {
-		case <-done:
-			// Done channel closed while sleeping, return without deleting entries
-			c.mu.Unlock()
-			return
-		default:
-		}
+	now := time.Now()
+	for c.expiry.Len() > 0 && !now.Before(c.expiry[0].ExpiresAt) {
+		ent := heap.Pop(&c.expiry).(*internal.Entry[K, V])
+		c.removeFromExpiry(ent, &evicted)
 	}
-	for _, ent := range c.buckets[bucketIdx].entries {
-		c.removeElement(ent, &evicted)
-	}
-	c.nextCleanupBucket = (c.nextCleanupBucket + 1) % numBuckets
 	c.mu.Unlock()
 	c.fireCallbacks(evicted)
-}
-
-// addToBucket adds entry to expire bucket so that it will be cleaned up when the time comes. Has to be called with lock!
-func (c *LRU[K, V]) addToBucket(e *internal.Entry[K, V]) {
-	bucketID := (numBuckets + c.nextCleanupBucket - 1) % numBuckets
-	e.ExpireBucket = bucketID
-	c.buckets[bucketID].entries[e.Key] = e
-	if c.buckets[bucketID].newestEntry.Before(e.ExpiresAt) {
-		c.buckets[bucketID].newestEntry = e.ExpiresAt
-	}
-}
-
-// removeFromBucket removes the entry from its corresponding bucket. Has to be called with lock!
-func (c *LRU[K, V]) removeFromBucket(e *internal.Entry[K, V]) {
-	delete(c.buckets[e.ExpireBucket].entries, e.Key)
 }
 
 // Cap returns the capacity of the cache
@@ -416,29 +424,110 @@ func (c *LRU[K, V]) Restart() {
 	case <-c.done:
 		// Channel is closed, need to recreate it
 		c.done = make(chan struct{})
+		c.wake = make(chan struct{}, 1)
 		c.cleanupStopped = false
-		c.startGoroutine()
+		c.startReaper()
 	default:
 		// Goroutine is already running, nothing to do
 	}
 }
 
-// startGoroutine starts the cleanup goroutine for expired entries.
-func (c *LRU[K, V]) startGoroutine() {
-	if c.ttl == noEvictionTTL {
+// startReaper launches the background cleanup goroutine once. It is started
+// eagerly for a finite default TTL, and lazily on the first finite-TTL entry
+// when expiration was disabled at construction. Has to be called with lock!
+func (c *LRU[K, V]) startReaper() {
+	if c.reaper || c.cleanupStopped {
 		return
 	}
+	c.reaper = true
 
-	go func(done <-chan struct{}) {
-		ticker := time.NewTicker(c.ttl / numBuckets)
-		defer ticker.Stop()
-		for {
+	go c.reap(c.done, c.wake)
+}
+
+// reap is the cleanup loop. It sleeps exactly until the soonest expiration
+// (or until a sooner-dying entry is added), then removes expired entries
+// from the top of the heap, so entries with different TTLs never take each
+// other down and no full-table scan is needed.
+func (c *LRU[K, V]) reap(done <-chan struct{}, wake <-chan struct{}) {
+	var timer *time.Timer
+	for {
+		c.mu.Lock()
+		if c.expiry.Len() == 0 {
+			c.mu.Unlock()
+
+			// Nothing to expire yet: park until an entry is added or
+			// the cache is closed.
 			select {
 			case <-done:
 				return
-			case <-ticker.C:
-				c.deleteExpired()
+			case <-wake:
 			}
+			continue
 		}
-	}(c.done)
+		wait := time.Until(c.expiry[0].ExpiresAt)
+		c.mu.Unlock()
+
+		if wait <= 0 {
+			wait = time.Nanosecond
+		}
+		if timer == nil {
+			timer = time.NewTimer(wait)
+		} else {
+			timer.Reset(wait)
+		}
+
+		select {
+		case <-done:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		case <-wake:
+			// A new sooner-expiring entry may have arrived; recompute.
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-timer.C:
+			c.deleteExpired()
+		}
+	}
+}
+
+// expiryHeap is a min-heap of entries ordered by ExpiresAt, soonest first.
+// It mirrors the entries tracked in c.items and keeps each entry's position
+// in sync through Entry.HeapIndex.
+type expiryHeap[K comparable, V any] []*internal.Entry[K, V]
+
+func (h expiryHeap[K, V]) Len() int { return len(h) }
+
+func (h expiryHeap[K, V]) Less(i, j int) bool {
+	return h[i].ExpiresAt.Before(h[j].ExpiresAt)
+}
+
+func (h expiryHeap[K, V]) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].HeapIndex = i
+	h[j].HeapIndex = j
+}
+
+func (h *expiryHeap[K, V]) Push(x any) {
+	ent := x.(*internal.Entry[K, V])
+	ent.HeapIndex = len(*h)
+	*h = append(*h, ent)
+}
+
+func (h *expiryHeap[K, V]) Pop() any {
+	old := *h
+	n := len(old)
+	ent := old[n-1]
+	old[n-1] = nil
+	ent.HeapIndex = -1
+	*h = old[:n-1]
+	return ent
 }
